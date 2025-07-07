@@ -1,1 +1,1 @@
-SUPPORTED_BWS = [2, 4, 6, 8]
+SUPPORTED_BWS = [2, 4, 8]

@@ -4,14 +4,59 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from transformers import get_scheduler, AutoTokenizer
-from modeling_gpt2 import SwitchableQuantLoRAModel
+from .modeling_gpt2 import SwitchableQuantLoRAModel
+from .defaults import SUPPORTED_BWS
 from tqdm import tqdm
 import evaluate
 import os
 from transformers.utils import logging
 from typing import List
-from defaults import SUPPORTED_BWS
+
+from torch.utils.tensorboard import SummaryWriter
+from datasets import load_dataset
 logging.get_logger("transformers").setLevel(logging.ERROR)
+
+def load_squad_train(tokenizer, num_samples=None):
+    train_dataset = load_dataset("squad", split="train").select(range(num_samples)) if num_samples else load_dataset("squad", split="train")
+    PROMPT_TEMPLATE = "{c}\n\n{q}\n\n"
+    INPUT_TEMPLATE = PROMPT_TEMPLATE + "{a}" + tokenizer.eos_token
+    def train_preprocess(examples):
+        tokenizer.padding_side = "right"
+        answers = [a['text'][0] for a in examples["answers"]]
+        # Create the full input tokens
+        inputs = [ INPUT_TEMPLATE.format(q=q,c=c,a=a) for q, c, a in zip(examples["question"], examples["context"], answers)]
+        prompt_lengths = [
+            len(tokenizer(PROMPT_TEMPLATE.format(q=q, c=c), max_length=1024, truncation=True, padding=False).input_ids)
+            for q, c in zip(examples["question"], examples["context"])
+        ]
+        input_lengths = [ len(tokenizer(i, max_length=1024, truncation=True, padding=False).input_ids) for i in inputs]# unpadded input
+        model_inputs = tokenizer(inputs, max_length=1024, truncation=True, padding="max_length", return_tensors="pt")
+        labels = model_inputs["input_ids"].clone()
+        # Create the Loss Mask
+        for i in range(len(labels)):
+            labels[i, :prompt_lengths[i]] = -100
+            labels[i, input_lengths[i]:] = -100
+        model_inputs["labels"] = labels
+        return model_inputs
+
+    train_dataset = train_dataset.map(train_preprocess, batched=True)
+    train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    return train_dataset
+
+def load_squad_dev(tokenizer, num_samples=200):
+    eval_dataset = load_dataset("squad", split="validation").select(range(num_samples)) if num_samples else load_dataset("squad", split="validation")
+    PROMPT_TEMPLATE = "{c}\n\n{q}\n\n"
+
+    def eval_preprocess(examples):
+        tokenizer.padding_side = "left"
+        prompts = [ PROMPT_TEMPLATE.format(q=q, c=c) for q, c in zip(examples["question"], examples["context"])]
+        model_inputs = tokenizer(prompts, max_length=824, truncation=True, padding="max_length", return_tensors="pt")
+        return model_inputs
+    
+    eval_info = {"id": eval_dataset["id"], "answers": eval_dataset["answers"]}
+    eval_dataset = eval_dataset.map(eval_preprocess, batched=True)
+    eval_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    return eval_dataset, eval_info
 
 class DistillationLoss(nn.Module):
     def __init__(self, temperature=1.0):
@@ -39,8 +84,10 @@ class Trainer:
         training_style:str='instantnet',
         lr=5e-5,
         batch_size=4,
-        kd_weight=1.0,
+        use_kd=False,
         supported_bws:List[int]=SUPPORTED_BWS,
+        writer: SummaryWriter = None,
+        logging_step: int = 5,
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.switchable_model = switchable_model
@@ -50,7 +97,11 @@ class Trainer:
         self.eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size) if eval_dataset else None
         self.eval_info = eval_info
         self.step = 0
-        self.kd_weight = kd_weight
+        self.use_kd = use_kd
+        self.kd_weight = 1.0
+        self.writer = writer
+        self.logging_step = logging_step
+        self.loss_accumulator = {}
 
         for p in self.switchable_model.model.parameters():
             p.requires_grad = False
@@ -61,10 +112,11 @@ class Trainer:
 
         # Define the bit-map configurations to be trained
         self.bitmaps = {
-            "all8": {name: 8 for name in self.switchable_model.target_modules},
-            "all6": {name: 6 for name in self.switchable_model.target_modules},
-            "all4": {name: 4 for name in self.switchable_model.target_modules},
-            "all2": {name: 2 for name in self.switchable_model.target_modules},
+            "8": {name: 8 for name in self.switchable_model.target_modules},
+            "stripe8&4": {name: 4*(n%2+1) for n, name in enumerate(self.switchable_model.target_modules)},
+            "4": {name: 4 for name in self.switchable_model.target_modules},
+            "stripe4&2": {name: 2*(n%2+1) for n, name in enumerate(self.switchable_model.target_modules)},
+            "2": {name: 2 for name in self.switchable_model.target_modules},
         }
         self.ordered_bws = list(sorted(supported_bws, reverse=True))
         self.kd_loss_fn = DistillationLoss(temperature=1.0)
@@ -115,9 +167,19 @@ class Trainer:
             progress_bar.update(1)
             self.step += 1
 
+            if self.writer and self.step % self.logging_step == 0:
+                for key, loss_list in self.loss_accumulator.items():
+                    if loss_list:
+                        avg_loss = sum(loss_list) / len(loss_list)
+                        training_style, loss_type, bw = key.split('_')
+                        tag = f'{training_style}/{loss_type.upper()}_loss/{bw}bit'
+                        self.writer.add_scalar(tag, avg_loss, self.step)
+                # Reset accumulator
+                self.loss_accumulator = {}
+
             if self.step % eval_every == 0:
                 self.evaluate()
-                self.save_model(os.path.join(save_dir, f"step_{step}"))
+                self.save_model(os.path.join(save_dir, f"step_{self.step}"))
                 self.switchable_model.model.train() # Set back to train mode
             
     def _train_step(self, batch):
@@ -126,6 +188,9 @@ class Trainer:
             return self._instantnet_step(batch)
         elif self.training_style == 'cyclic':
             return self._cyclic_step(batch)
+        elif self.training_style == 'spnet':
+            return self._spnet_step(batch)
+
         else:
             raise ValueError(f"Unknown training style: {self.training_style}")
 
@@ -134,7 +199,7 @@ class Trainer:
             print("No evaluation dataset provided. Skipping evaluation.")
             return
         
-        print(f"\n--- Running Evaluation at Step {self.step}---")
+        tqdm.write(f"--- Running Evaluation at Step {self.step}---")
         self.switchable_model.model.eval()
         squad_metric = evaluate.load("squad")
 
@@ -142,7 +207,7 @@ class Trainer:
         for name, bitmap in self.bitmaps.items():
             self.switchable_model.set_config(bitmap)
             generated_texts = []
-            for batch in tqdm(self.eval_dataloade, leave=False):
+            for batch in tqdm(self.eval_dataloader, leave=False):
                 inputs = {k: v.to(self.device) for k, v in batch.items()}
                 with torch.no_grad():
                     generated_ids = self.switchable_model.model.generate(
@@ -174,18 +239,9 @@ class Trainer:
         logits_cache = {}
         total_loss = 0.0
 
-        # Get FP16/FP32 teacher logits
-        with torch.no_grad():
-            with self.switchable_model.model.disable_adapter():
-                for module in self.switchable_model.quant_named_modules.values():
-                    module.set_bit_width(0)
-                
-                teacher_16bit_logits = self.switchable_model.model(**batch).logits
-                logits_cache[16] = teacher_16bit_logits
-
         # Loop through student configs from highest to lowest precision
-        for bw in self.ordered_bws:
-            current_bitmap = self.bitmaps[f"all{bw}"]
+        for bw_order, bw in enumerate(self.ordered_bws):
+            current_bitmap = self.bitmaps[str(bw)]
             self.switchable_model.set_config(current_bitmap)
             self.switchable_model.check_config(current_bitmap)
 
@@ -196,11 +252,18 @@ class Trainer:
 
             # Calculate KD loss from all higher-precision teachers
             kd_loss = 0.0
-            attn_mask = batch["attention_mask"]
-            teachers = [t for t in logits_cache.keys() if t > bw]
-            for teacher_bw in teachers:
-                teacher_logits = logits_cache[teacher_bw]
-                kd_loss += self.kd_loss_fn(teacher_logits.detach(), student_logits, mask=attn_mask)
+            if bw_order > 0 and self.step > 300 and self.use_kd:
+                attn_mask = batch["attention_mask"]
+                teachers = [t for t in logits_cache.keys() if t > bw]
+                for teacher_bw in teachers:
+                    teacher_logits = logits_cache[teacher_bw]
+                    kd_loss += self.kd_loss_fn(teacher_logits.detach(), student_logits, mask=attn_mask)
+                
+            if self.writer:
+                self.loss_accumulator.setdefault(f'instantnet_ce_{bw}', []).append(ce_loss.item())
+                if kd_loss > 0.:
+                    self.loss_accumulator.setdefault(f'instantnet_kd_{bw}', []).append(kd_loss.item())
+
             loss = ce_loss + self.kd_weight*kd_loss
             total_loss += loss.item()
             # scale the loss for gradient accumulation
@@ -208,19 +271,46 @@ class Trainer:
 
         self.optimizer.step()
         return torch.tensor(total_loss / len(self.ordered_bws))
+    
+    def _spnet_step(self, batch):
+        """Aggregate loss from all quantization configurations"""
+        self.optimizer.zero_grad()
+        total_loss = 0.0
+        for bitmap_name, current_bitmap in self.bitmaps.items():
+            self.switchable_model.set_config(current_bitmap)
+            self.switchable_model.check_config(current_bitmap)
+
+            outputs = self.switchable_model.model(**batch)
+            ce_loss = outputs.loss
+       
+            if self.writer:
+                self.loss_accumulator.setdefault(f'spnet_ce_{bitmap_name}', []).append(ce_loss.item())
+            total_loss += ce_loss.item()
+            # scale the loss for gradient accumulation
+            (ce_loss / len(self.bitmaps)).backward()
+
+        self.optimizer.step()
+        return torch.tensor(total_loss / len(self.bitmaps))
 
     def _cyclic_step(self, batch):
         """Performs a single training step with a single, cycling precision config."""
-        current_bw = self.ordered_bws[self.step % len(self.ordered_bws)]
-        current_bitmap = self.bitmaps[f"all{current_bw}"]
-        
-        self.switchable_model.set_config(current_bitmap)
-        self.switchable_model.check_config(current_bitmap)
-        
-        outputs = self.switchable_model(**batch)
-        loss = outputs.loss
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        
-        return loss
+        # current_bw = self.ordered_bws[self.step % len(self.ordered_bws)]
+        # current_bitmap = self.bitmaps[f"all{current_bw}"]
+
+        total_loss = 0.0
+        for bitmap_name, current_bitmap in self.bitmaps.items():
+            
+            self.switchable_model.set_config(current_bitmap)
+            self.switchable_model.check_config(current_bitmap)
+            
+            outputs = self.switchable_model(**batch)
+            loss = outputs.loss
+
+            if self.writer:
+                self.loss_accumulator.setdefault(f'cyclic_ce_{bitmap_name}', []).append(loss.item())
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            total_loss += loss.item()
+        return torch.tensor(total_loss / len(self.bitmaps))

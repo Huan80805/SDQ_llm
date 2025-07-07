@@ -1,6 +1,7 @@
 .*
 checkpoints/*
 src/__pycache__
-tests/__pycache__
-tests/.pytest_cache
+.pytest_cache
+__pycache__
 check_cuda.py
+logs/

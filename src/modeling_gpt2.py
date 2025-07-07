@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
-from quant_utils import QuantLinear
+from .quant_utils import QuantLinear, InferenceQuantLinear
+from .defaults import SUPPORTED_BWS
 from transformers.modeling_utils import Conv1D 
 from peft import get_peft_model, LoraConfig, PeftModel
 import warnings
 from typing import Dict
-from defaults import SUPPORTED_BWS
+
 # GPT-2 Config:
 # GPT2Model(
 #   (wte): Embedding(50257, 768)
@@ -33,40 +34,6 @@ from defaults import SUPPORTED_BWS
 #   (ln_f): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
 # )
 
-def _recursive_patch_quantization(module, prefix=""):
-    """
-    Walks through a module and replaces Conv1D layers with QuantLinear layers.
-
-    Args:
-        module (nn.Module): The module to patch.
-        prefix (str): The prefix for layer names.
-    """
-    for name, child in module.named_children():
-        # Construct the full name of the child module
-        full_name = f"{prefix}.{name}" if prefix else name
-        if isinstance(child, Conv1D):
-            in_features = child.weight.shape[0]
-            out_features = child.weight.shape[1]
-            device = child.weight.device
-            q_layer = QuantLinear(
-                in_features=in_features,
-                out_features=out_features,
-                bias=(child.bias is not None),
-                device=device
-            )
-            # Copy the weights and bias from the original layer
-            q_layer.weight.data.copy_(child.weight.data.t())
-            if child.bias is not None:
-                q_layer.bias.data.copy_(child.bias.data)
-            
-            setattr(module, name, q_layer)
-            
-            # Replace the original layer with the new quantized layer
-            setattr(module, name, q_layer)
-        else:
-            # If it's not a Linear layer, recurse deeper
-            _recursive_patch_quantization(child, prefix=full_name)
-
 def patch_gpt2_with_quantization(model: AutoModelForCausalLM):
     """
     Applies quantization to a GPT-2 model by replacing all nn.Linear layers with QuantLinear layers.
@@ -76,7 +43,62 @@ def patch_gpt2_with_quantization(model: AutoModelForCausalLM):
     Returns:
         AutoModelForCausalLM: The patched model with QuantLinear layers.
     """
-    _recursive_patch_quantization(model)
+    # Get a list of all linear layer names in the model
+    source_modules = {name: module for name, module in model.named_modules() if isinstance(module, Conv1D)}
+    for name, child_mod in source_modules.items():
+        # Navigate to the parent module
+        parent_name, child_name = name.rsplit('.', 1)
+        in_features = child_mod.weight.shape[0]
+        out_features = child_mod.weight.shape[1]
+        parent_mod = model.get_submodule(parent_name)
+        
+        # Create the QuantLinear layer
+        device = child_mod.weight.device
+        q_layer = QuantLinear(
+            in_features=in_features,
+            out_features=out_features,
+            bias=(child_mod.bias is not None),
+            device=device
+        )
+
+        # Copy the weights and bias from the original layer
+        q_layer.weight.data.copy_(child_mod.weight.data.t())
+        if child_mod.bias is not None:
+            q_layer.bias.data.copy_(child_mod.bias.data)
+        # Replace the layer in the new model
+        setattr(parent_mod, child_name, q_layer)
+    return model
+
+def create_qunat_model_for_inference(model:AutoModelForCausalLM, bitmap_config:Dict[str, int]):
+    """
+    Converts a adapter-merged model into a truly quantized inference model by replacing its linear layers in-place.
+    """
+    # Get a list of all linear layer names in the model
+    source_modules = {name: module for name, module in model.named_modules() if isinstance(module, Conv1D)}
+
+    for name, child_mod in source_modules.items():
+        # Navigate to the parent module
+        parent_name, child_name = name.rsplit('.', 1)
+
+        bit_width = bitmap_config.get(name, 8) # Default to 8 if not specified
+        in_features = child_mod.weight.shape[0]
+        out_features = child_mod.weight.shape[1]
+        parent_mod = model.get_submodule(parent_name)
+        device = child_mod.weight.device
+
+        # Create the InferenceQuantLinear layer
+        inf_layer = InferenceQuantLinear(
+            in_features,
+            out_features,
+            bias=(child_mod.bias is not None),
+            bit_width=bit_width
+        ).to(device)
+        
+        # Use the weights from the source module in the merged model to quantize and pack the weights for the new inference layer.
+        inf_layer.quantize_and_pack(child_mod.weight.data.t(), child_mod.bias.data if child_mod.bias is not None else None)
+        # Replace the original QuantLinear layer with the new, memory-efficient InferenceQuantLinear layer
+        setattr(parent_mod, child_name, inf_layer)
+
     return model
 
 class SwitchableQuantLoRAModel:
@@ -84,13 +106,6 @@ class SwitchableQuantLoRAModel:
     def __init__(self, model: PeftModel, target_modules: list[str]):
         self.model = model
         self.target_modules = target_modules
-        self.quant_named_modules = {}
-        for name, module in model.named_modules():
-            module_name = name.removeprefix('base_model.model.').removesuffix('.base_layer')
-            if module_name in target_modules and isinstance(module, QuantLinear):
-                self.quant_named_modules[module_name] = module
-        assert len(self.quant_named_modules) == len(self.target_modules), 'some target modules are not quantized'
-
     def set_config(self, bitmap: Dict[str, int]):
         """
         Sets the active adapters based on quantization config (bitmap), also change bitwidth in QuantLinear layers
@@ -103,9 +118,11 @@ class SwitchableQuantLoRAModel:
         for module_full_name, bw in bitmap.items():
             adapter_name = module_full_name.replace('.', '-') + f'-{bw}'
             active_adapters.append(adapter_name)
+            # Get QuantLinear layer, now module_full_name is a adapter layer, have to get base_layer
+            qunat_linear_layer = self.model.base_model.get_submodule(module_full_name + ".base_layer")
+            qunat_linear_layer.set_bit_width(bw)
+
         self.model.base_model.set_adapter(active_adapters)
-        for module_full_name, bw in bitmap.items():
-            self.quant_named_modules[module_full_name].set_bit_width(bw)
 
     def check_config(self, bitmap: Dict[str, int]):
         """
@@ -121,7 +138,8 @@ class SwitchableQuantLoRAModel:
         # Check that QuantLinear layers have the right bit-width
         for module_full_name, bw in bitmap.items():
             # Verify the bit_width of the underlying layer
-            actual_bw = self.quant_named_modules[module_full_name].bit_width
+            qunat_layer_base = self.model.base_model.get_submodule(module_full_name + ".base_layer")
+            actual_bw = qunat_layer_base.bit_width
             assert actual_bw == bw, f"Actual bit width={actual_bw} in {module_full_name} not the same in bitmap:{bw}"
         # Check active adapters require_grad = True, otherwise False
         for name, require_grad in self.model.get_model_status().requires_grad.items():
@@ -153,7 +171,6 @@ def patch_gpt2_with_adaptive_adapters(model: AutoModelForCausalLM, supported_bws
         if isinstance(module, QuantLinear)
     ]
     print(f"- {len(target_modules)} target layers for LoRA")
-
     base_config = LoraConfig(r=8, target_modules=["c_attn"]) # A dummy adapter, will be deleted
     peft_model = get_peft_model(model, base_config, "base_adapter")
 
