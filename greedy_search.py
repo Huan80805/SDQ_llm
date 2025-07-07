@@ -8,131 +8,80 @@ import json
 import subprocess
 import re
 import pandas as pd
-
-def run_evaluation(model_path, bitmap, batch_size):
-    """
-    Calls the evaluation_harness.py script as a subprocess and parses its output.
-    """
-    bitmap_str = ",".join(map(str, bitmap))
-    command = [
-        "python", "evaluation_harness.py",
-        "--model_path", model_path,
-        "--bitmap", bitmap_str,
-        "--batch_size", str(batch_size)
-    ]
-    
-    print(f"\nRunning evaluation for bitmap: [{bitmap_str[:30]}...]")
-    result = subprocess.run(command, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print("--- ERROR ---")
-        print(result.stderr)
-        raise RuntimeError("Evaluation harness failed to run.")
-
-    # Parse the CSV output from the harness
-    output = result.stdout
-    # Find the last line that looks like CSV
-    csv_line = None
-    for line in reversed(output.splitlines()):
-        if re.match(r'^custom_map,', line):
-            csv_line = line
-            break
-    
-    if not csv_line:
-        print("--- ERROR: Could not parse evaluation output ---")
-        print(output)
-        raise ValueError("Failed to find CSV output from evaluation harness.")
-
-    parts = csv_line.strip().split(',')
-    metrics = {
-        "EM": float(parts[2]),
-        "F1": float(parts[3]),
-        "tokens_per_s": float(parts[4]),
-        "VRAM_MB": float(parts[5])
-    }
-    return metrics
-
+from src import SUPPORTED_BWS
+from quant_model_eval import eval_model_with_bitmap
+from tqdm import tqdm
 def main():
     parser = argparse.ArgumentParser(description="Greedy Search for Optimal Mixed-Precision Bitmap")
-    parser.add_argument('--model_path', type=str, required=True, help='Path to the directory with saved LoRA adapters.')
-    parser.add_argument('--sensitivity_file', type=str, default='sensitivity_ranking.json', help='Path to the sensitivity ranking JSON file.')
-    parser.add_argument('--budget', type=float, default=0.5, help='Maximum acceptable drop in EM score.')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation.')
-    parser.add_argument('--output_csv', type=str, default='greedy_search_results.csv', help='Path to save the results of the search.')
-
+    parser.add_argument('--model_path', '-m', type=str, required=True, help='Path to the directory with saved LoRA adapters.')
+    parser.add_argument('--sensitivity_file', '-sf', type=str, help='Path to the sensitivity ranking JSON file.')
+    parser.add_argument('--budget', type=float, default=0.3, help='Maximum acceptable drop (in ratio) in F1 score.')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for evaluation.')
+    parser.add_argument('--max_trials', type=int, default=5, help='Maximum trails to quantize different linear layers to a lower precision')
+    parser.add_argument('--output_jsonl', '-o', type=str, default='./analysis/greedy_search_spnet.jsonl', help='Path to save the results of the search.')
+    parser.add_argument('--num_samples', '-n', type=int, default=500, help='Number of samples to do eval (for speedup)')
     args = parser.parse_args()
 
-    # --- Load Sensitivity Ranking ---
+    # --- Load Sensitivity Analysis File and Rank by Layers ---
     with open(args.sensitivity_file, 'r') as f:
-        sensitivity_ranking = json.load(f)
+        error_totals = json.load(f)
+        # --- Rank layers by sensitivity---
+    ERROR_TYPE = "mse"
+    ranking = {}
+    for bw in SUPPORTED_BWS:
+        sorted_layers = sorted(error_totals.keys(), key=lambda k: error_totals[k][f'{bw}-bit'][ERROR_TYPE])
+        ranking[f'{bw}bit'] = sorted_layers
     
-    num_layers = len(sensitivity_ranking['rank_4bit'])
+    ordered_layer_names = list(error_totals.keys()) # architectural layers in order
+    num_layers = len(ordered_layer_names)
     results_log = []
 
+    # --- Baseline Evaluation (all FP) ---
+    print(f"\n- Evaluting FP GPT2 ...")
+    baseline_bitmap = [0] * num_layers # not using layer name for simplicity
+    baseline_metrics = eval_model_with_bitmap(args.model_path, baseline_bitmap, args.batch_size, num_eval_samples=args.num_samples, split="train", verbose=False)
+    results_log.append({'bitmap': baseline_bitmap, **baseline_metrics, 'accepted': True})
+    base_F1 = baseline_metrics['F1']
+    budget = args.budget * base_F1
     # --- Baseline Evaluation (all 8-bit) ---
-    print("--- Step 1: Evaluating baseline (all 8-bit) ---")
-    baseline_bitmap = [8] * num_layers
-    baseline_metrics = run_evaluation(args.model_path, baseline_bitmap, args.batch_size)
-    base_em = baseline_metrics['EM']
-    print(f"Baseline EM: {base_em:.2f}, VRAM: {baseline_metrics['VRAM_MB']:.2f} MB")
-    results_log.append({'name': 'baseline_all_8', 'bitmap': baseline_bitmap, **baseline_metrics})
-
-    # --- Greedy Search for 4-bit ---
-    print(f"\n--- Step 2: Greedy search for 4-bit (EM budget: {args.budget}) ---")
-    current_bitmap = list(baseline_bitmap)
+    print(f"\n- Evaluting Int8 GPT2 ...")
+    eval_model_with_bitmap(args.model_path, [8] * num_layers, args.batch_size, num_eval_samples=args.num_samples, split="train", verbose=False)
+    # results_log.append({'bitmap': baseline_bitmap, **baseline_metrics})
     
-    for layer_name in sensitivity_ranking['rank_4bit']:
-        layer_idx = sensitivity_ranking['rank_4bit'].index(layer_name)
-        
-        if current_bitmap[layer_idx] == 8: # Only try to quantize layers that are still 8-bit
-            trial_bitmap = list(current_bitmap)
-            trial_bitmap[layer_idx] = 4
-            
-            trial_metrics = run_evaluation(args.model_path, trial_bitmap, args.batch_size)
-            
-            if base_em - trial_metrics['EM'] <= args.budget:
-                print(f"  [ACCEPT] {layer_name} -> 4-bit. EM drop: {base_em - trial_metrics['EM']:.2f} <= {args.budget}")
-                current_bitmap = trial_bitmap
-                # Update the base_em to the new accepted value
-                base_em = trial_metrics['EM'] 
-            else:
-                print(f"  [REJECT] {layer_name} -> 4-bit. EM drop: {base_em - trial_metrics['EM']:.2f} > {args.budget}")
+    # --- Greedy Search for lower precision ---
+    current_bitmap = list(baseline_bitmap)
+    for bw in sorted(SUPPORTED_BWS, reverse=True):
+        print(f"\n- Greedy search for {bw}-bit (F1 budget: {budget})")
+        num_accepted_layers, num_rejected_layers = 0, 0
+        for layer_name in tqdm(ranking[f'{bw}bit'], total=len(ranking[f'{bw}bit'])):
+            layer_idx = ordered_layer_names.index(layer_name)
+            if (current_bitmap[layer_idx] > bw) or (current_bitmap[layer_idx] == 0):
+                trial_bitmap = list(current_bitmap)
+                trial_bitmap[layer_idx] = bw
+                # eval new bitmap
+                trial_metrics = eval_model_with_bitmap(args.model_path, trial_bitmap, args.batch_size, num_eval_samples=args.num_samples, split="train", verbose=False)
+                if base_F1 - trial_metrics['F1'] <= budget:
+                    tqdm.write(f"  [ACCEPT] {layer_name} -> {bw}-bit. F1 drop: {base_F1 - trial_metrics['F1']:.2f} <= {budget}")
+                    results_log.append({'bitmap': current_bitmap, **trial_metrics, 'accepted': True})
+                    current_bitmap = trial_bitmap
+                    num_accepted_layers += 1
+                    
+                else:
+                    tqdm.write(f"  [REJECT] {layer_name} -> {bw}-bit. F1 drop: {base_F1 - trial_metrics['F1']:.2f} > {budget}")
+                    results_log.append({'bitmap': current_bitmap, **trial_metrics, 'accepted': False})
+                    num_rejected_layers += 1
+                    if num_rejected_layers >= args.max_trials:
+                        tqdm.write('  Max trials reached, moving to next precision')
+                        break
+        print(f"\n- Finished {bw}-bit search. Evaluating final bitmap...")
+        eval_model_with_bitmap(args.model_path, current_bitmap, args.batch_size, args.num_samples, "train", verbose=False)
+        # results_log.append({'bitmap': current_bitmap, **metrics})
 
-    print("\n--- Finished 4-bit search. Evaluating final 4-bit mixed map ---")
-    final_4bit_metrics = run_evaluation(args.model_path, current_bitmap, args.batch_size)
-    results_log.append({'name': 'mixed_4bit', 'bitmap': current_bitmap, **final_4bit_metrics})
-
-    # --- Greedy Search for 2-bit ---
-    print(f"\n--- Step 3: Greedy search for 2-bit (EM budget: {args.budget}) ---")
-    # Use the 2-bit sensitivity ranking now
-    for layer_name in sensitivity_ranking['rank_2bit']:
-        layer_idx = sensitivity_ranking['rank_2bit'].index(layer_name)
-        
-        # Only try to quantize layers that are currently 4-bit or 8-bit
-        if current_bitmap[layer_idx] > 2:
-            trial_bitmap = list(current_bitmap)
-            trial_bitmap[layer_idx] = 2
-            
-            trial_metrics = run_evaluation(args.model_path, trial_bitmap, args.batch_size)
-            
-            if base_em - trial_metrics['EM'] <= args.budget:
-                print(f"  [ACCEPT] {layer_name} -> 2-bit. EM drop: {base_em - trial_metrics['EM']:.2f} <= {args.budget}")
-                current_bitmap = trial_bitmap
-                base_em = trial_metrics['EM']
-            else:
-                print(f"  [REJECT] {layer_name} -> 2-bit. EM drop: {base_em - trial_metrics['EM']:.2f} > {args.budget}")
-
-    print("\n--- Finished 2-bit search. Evaluating final 2-bit mixed map ---")
-    final_2bit_metrics = run_evaluation(args.model_path, current_bitmap, args.batch_size)
-    results_log.append({'name': 'mixed_2bit', 'bitmap': current_bitmap, **final_2bit_metrics})
 
     # --- Save results to CSV ---
     df = pd.DataFrame(results_log)
-    df['bitmap'] = df['bitmap'].apply(lambda x: str(x)) # Convert list to string for CSV
-    df.to_csv(args.output_csv, index=False)
-    print(f"\nGreedy search complete. Results saved to {args.output_csv}")
-    print("\nFinal Results Summary:")
-    print(df[['name', 'EM', 'F1', 'VRAM_MB', 'tokens_per_s']].to_string(index=False))
+    df.to_json(args.output_jsonl, lines=True, orient="records")
+    print(f"\nGreedy search complete. Results saved to {args.output_jsonl}")
 
 if __name__ == "__main__":
     main()

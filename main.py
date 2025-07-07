@@ -7,12 +7,12 @@ from src import (
     SUPPORTED_BWS,
     Trainer,
     load_squad_train,
-    load_squad_dev
+    load_squad_eval
 )
 import os
 import argparse
 from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime
+from src import load_generated_train
 def main():
     parser = argparse.ArgumentParser(description="GPT-2 Quantization and Training")
     parser.add_argument('--use_tensorboard', action='store_true', help='Enable tensorboard logging')
@@ -23,14 +23,14 @@ def main():
     parser.add_argument('--total_steps', type=int, default=1000, help='Total training steps')
     parser.add_argument('--eval_every', type=int, default=100, help='Evaluate every N steps')
     parser.add_argument('--logging_step', type=int, default=5, help='Log every N steps')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints/cyclic', help='Directory to save checkpoints')
+    parser.add_argument('--save_dir', type=str, default='./ft_checkpoints', help='Directory to save checkpoints')
+    parser.add_argument('--exp_name', type=str)
 
     args = parser.parse_args()
 
     writer = None
     if args.use_tensorboard:
-        subdir = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-        writer = SummaryWriter(os.path.join(args.tensorboard_log_dir, subdir))
+        writer = SummaryWriter(os.path.join(args.tensorboard_log_dir, args.exp_name))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained('gpt2').to(device)
@@ -43,7 +43,8 @@ def main():
     print("- Patching quantized model with adaptive Lora...")
     switchable_model = patch_gpt2_with_adaptive_adapters(quant_model, supported_bws=SUPPORTED_BWS)
     train_dataset = load_squad_train(tokenizer)
-    eval_dataset, eval_info = load_squad_dev(tokenizer)
+    # train_dataset = load_generated_train(tokenizer)
+    eval_dataset, eval_info = load_squad_eval(tokenizer)
     trainer = Trainer(
         switchable_model=switchable_model,
         tokenizer=tokenizer,
@@ -57,7 +58,7 @@ def main():
         writer=writer,
         logging_step=args.logging_step
     )
-    trainer.train(total_steps=args.total_steps, eval_every=args.eval_every, save_dir=args.save_dir)
+    trainer.train(total_steps=args.total_steps, eval_every=args.eval_every, save_dir=os.path.join(args.save_dir, args.exp_name))
 
     if writer:
         writer.close()

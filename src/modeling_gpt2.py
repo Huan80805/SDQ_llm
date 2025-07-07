@@ -69,38 +69,6 @@ def patch_gpt2_with_quantization(model: AutoModelForCausalLM):
         setattr(parent_mod, child_name, q_layer)
     return model
 
-def create_qunat_model_for_inference(model:AutoModelForCausalLM, bitmap_config:Dict[str, int]):
-    """
-    Converts a adapter-merged model into a truly quantized inference model by replacing its linear layers in-place.
-    """
-    # Get a list of all linear layer names in the model
-    source_modules = {name: module for name, module in model.named_modules() if isinstance(module, Conv1D)}
-
-    for name, child_mod in source_modules.items():
-        # Navigate to the parent module
-        parent_name, child_name = name.rsplit('.', 1)
-
-        bit_width = bitmap_config.get(name, 8) # Default to 8 if not specified
-        in_features = child_mod.weight.shape[0]
-        out_features = child_mod.weight.shape[1]
-        parent_mod = model.get_submodule(parent_name)
-        device = child_mod.weight.device
-
-        # Create the InferenceQuantLinear layer
-        inf_layer = InferenceQuantLinear(
-            in_features,
-            out_features,
-            bias=(child_mod.bias is not None),
-            bit_width=bit_width
-        ).to(device)
-        
-        # Use the weights from the source module in the merged model to quantize and pack the weights for the new inference layer.
-        inf_layer.quantize_and_pack(child_mod.weight.data.t(), child_mod.bias.data if child_mod.bias is not None else None)
-        # Replace the original QuantLinear layer with the new, memory-efficient InferenceQuantLinear layer
-        setattr(parent_mod, child_name, inf_layer)
-
-    return model
-
 class SwitchableQuantLoRAModel:
     """A wrapper to manage the PEFT model and switchable precision / adapters """
     def __init__(self, model: PeftModel, target_modules: list[str]):
@@ -117,7 +85,8 @@ class SwitchableQuantLoRAModel:
         active_adapters = []
         for module_full_name, bw in bitmap.items():
             adapter_name = module_full_name.replace('.', '-') + f'-{bw}'
-            active_adapters.append(adapter_name)
+            if bw != 0:
+                active_adapters.append(adapter_name)
             # Get QuantLinear layer, now module_full_name is a adapter layer, have to get base_layer
             qunat_linear_layer = self.model.base_model.get_submodule(module_full_name + ".base_layer")
             qunat_linear_layer.set_bit_width(bw)
@@ -128,13 +97,13 @@ class SwitchableQuantLoRAModel:
         """
         check model's config are the same as bitmap, also checks require_grad
         """
-        model_adapters = self.model.get_model_status().active_adapters
+        model_adapters = self.model.active_adapters
         active_adapters = []
         for module_full_name, bw in bitmap.items():
-            adapter_name = module_full_name.replace('.', '-') + f'-{bw}'
-            active_adapters.append(adapter_name)
-        if not set(model_adapters) == set(active_adapters):
-            raise AssertionError('model\'s active adapters are not the same as bitmap specified')
+            if bw != 0:
+                adapter_name = module_full_name.replace('.', '-') + f'-{bw}'
+                active_adapters.append(adapter_name)
+        assert set(model_adapters) == set(active_adapters), 'model\'s active adapters are not the same as bitmap specified'
         # Check that QuantLinear layers have the right bit-width
         for module_full_name, bw in bitmap.items():
             # Verify the bit_width of the underlying layer
@@ -150,8 +119,37 @@ class SwitchableQuantLoRAModel:
     def __call__(self, *args, **kwargs):
         """Pass calls through to the underlying model."""
         return self.model(*args, **kwargs)
+    
+def create_quant_model_for_inference(model: PeftModel, bitmap_config:Dict[str, int]):
+    """
+    Converts into a truly quantized inference model by replacing its linear layers in-place.
+    """
+    # Get a list of all linear layer names in the model
+    source_modules = {name: module for name, module in model.base_model.model.named_modules() if isinstance(module, QuantLinear)}
+    assert len(source_modules) > 0, "Empty source_modules"
+    for name, child_mod in source_modules.items():
+        # Navigate to the parent module
+        parent_name, child_name = name.rsplit('.', 1)
+        bit_width = bitmap_config[name.removesuffix('.base_layer')]
+        if bit_width == 0: continue
+        parent_mod = model.get_submodule(parent_name)
+        device = child_mod.weight.device
+        # Create the InferenceQuantLinear layer
+        inf_layer = InferenceQuantLinear(
+            child_mod.in_features,
+            child_mod.out_features,
+            bias=(child_mod.bias is not None),
+            bit_width=bit_width
+        ).to(device)
+        
+        # Use the weights from the source module to quantize and pack the weights for the new inference layer.
+        inf_layer.quantize_and_pack(child_mod.weight.data, child_mod.bias.data if child_mod.bias is not None else None)
+        # Replace the original QuantLinear layer with the new, memory-efficient InferenceQuantLinear layer
+        setattr(parent_mod, child_name, inf_layer)
 
-def patch_gpt2_with_adaptive_adapters(model: AutoModelForCausalLM, supported_bws = SUPPORTED_BWS) -> SwitchableQuantLoRAModel:
+    return model
+
+def patch_gpt2_with_adaptive_adapters(model: AutoModelForCausalLM, supported_bws = SUPPORTED_BWS, verbose = False) -> SwitchableQuantLoRAModel:
     """
     Patch GPT2 with multiple adapters in each layer, will patch $supported_bws adapters (e.g. 2/4/8 bits) for each linear layers
 
@@ -159,35 +157,39 @@ def patch_gpt2_with_adaptive_adapters(model: AutoModelForCausalLM, supported_bws
         model (AutoModelForCausalLM): The GPT2Model already patched with QuantLinear layers
         supported_bws (List[str]): list of supported bitwidth
     """
-    print('Patching model with adapters, will enable adaptive adapters based on quant level')
+    if verbose:
+        print('- Patching model with adapters, will enable adaptive adapters based on quant level')
     # Freeze all parameters of the base quantized model
     for param in model.parameters():
         param.requires_grad = False
-    print(f"- Froze base model, will add adapters for supported bit-widths: {supported_bws}")
+    if verbose:
+        print(f"- Froze base model, will add adapters for supported bit-widths: {supported_bws}")
 
     # target_modules: all QuantLinear layers in the model.
     target_modules = [
         name for name, module in model.named_modules()
         if isinstance(module, QuantLinear)
     ]
-    print(f"- {len(target_modules)} target layers for LoRA")
+    if verbose:
+        print(f"- {len(target_modules)} target layers for LoRA")
     base_config = LoraConfig(r=8, target_modules=["c_attn"]) # A dummy adapter, will be deleted
     peft_model = get_peft_model(model, base_config, "base_adapter")
-
+    get_rank_by_bw = {8: 16, 4:32, 2: 64}
     # loop and add a specific adapter for each layer and bit-width
     for module_full_name in target_modules:
         for bw in supported_bws:
             adapter_name = module_full_name.replace('.', '-') + f'-{bw}'
             config = LoraConfig(
-                r=16, # In a real scenario, rank could be a function of bit-width
-                lora_alpha=16,
+                r=get_rank_by_bw[bw],
+                lora_alpha=get_rank_by_bw[bw]*2,
                 target_modules=[module_full_name]
             )
             peft_model.add_adapter(adapter_name, config)
             peft_model.set_adapter(adapter_name)
     peft_model.disable_adapter()
     peft_model.delete_adapter('base_adapter')
-    print(f"- Added {len(peft_model.peft_config)} total adapters.")
+    if verbose:
+        print(f"- Added {len(peft_model.peft_config)} total adapters.")
     assert len(peft_model.peft_config) == (len(supported_bws)*len(target_modules))
 
     return SwitchableQuantLoRAModel(peft_model, target_modules)

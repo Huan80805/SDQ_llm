@@ -1,7 +1,11 @@
 .*
-checkpoints/*
-src/__pycache__
 .pytest_cache
 __pycache__
+checkpoints/*
+src/__pycache__
 check_cuda.py
 logs/
+squad_gpt_sft/*
+test.json
+advbench/
+squad_gpt_sft/

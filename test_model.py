@@ -60,7 +60,7 @@ def test_adaptive_lora():
 
     quant_model = patch_gpt2_with_quantization(model)
     print("- Patching quantized model with adaptive Lora...")
-    sqlm = patch_gpt2_with_adaptive_adapters(quant_model)
+    sqlm = patch_gpt2_with_adaptive_adapters(quant_model, verbose=True)
     # Configuration 1: First layer is 4-bit, the rest are 8-bit
     config1 = {}
     for module_full_name in sqlm.target_modules:

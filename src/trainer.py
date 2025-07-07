@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from transformers import get_scheduler, AutoTokenizer
 from .modeling_gpt2 import SwitchableQuantLoRAModel
-from .defaults import SUPPORTED_BWS
+from .defaults import SUPPORTED_BWS, PROMPT_TEMPLATE
 from tqdm import tqdm
 import evaluate
 import os
@@ -16,9 +16,48 @@ from torch.utils.tensorboard import SummaryWriter
 from datasets import load_dataset
 logging.get_logger("transformers").setLevel(logging.ERROR)
 
-def load_squad_train(tokenizer, num_samples=None):
-    train_dataset = load_dataset("squad", split="train").select(range(num_samples)) if num_samples else load_dataset("squad", split="train")
-    PROMPT_TEMPLATE = "{c}\n\n{q}\n\n"
+from datasets import load_from_disk, load_dataset
+
+def load_generated_train(tokenizer, num_samples=None):
+    """
+    Prepare the GPT-2-generated SQuAD data for SFT, masking out the prompt
+    so the loss is applied only to the model-generated continuation.
+    Returns a HF Dataset with columns: input_ids, attention_mask, labels (torch tensors).
+    """
+    data_dir = './squad_gpt2_sft'
+    if data_dir is not None:
+        ds = load_from_disk(data_dir)
+    if num_samples:
+        ds = ds.select(range(num_samples))
+
+    def preprocess(examples):
+        tokenizer.padding_side = "right"
+        prompts = examples["prompt"]
+        full = [text + tokenizer.eos_token for text in examples["text"]]
+        prompt_lens = [ len(tokenizer(p, max_length=1024, truncation=True, padding=False).input_ids)
+            for p in prompts
+        ]
+        full_lens = [
+            len(tokenizer(t, max_length=1024, truncation=True, padding=False).input_ids)
+            for t in full
+        ]
+        model_inputs = tokenizer( 
+            full, max_length=1024, truncation=True, padding="max_length", return_tensors="pt",
+        )
+        labels = model_inputs["input_ids"].clone()
+        for i in range(len(labels)):
+            labels[i, :prompt_lens[i]] = -100
+            labels[i, full_lens[i]:] = -100
+
+        model_inputs["labels"] = labels
+        return model_inputs
+    ds = ds.map(preprocess, batched=True)
+    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    return ds
+
+def load_squad_train(tokenizer, num_samples=None, split="train"):
+    train_dataset = load_dataset("squad", split=split)
+    train_dataset = train_dataset.select(range(num_samples)) if num_samples else train_dataset
     INPUT_TEMPLATE = PROMPT_TEMPLATE + "{a}" + tokenizer.eos_token
     def train_preprocess(examples):
         tokenizer.padding_side = "right"
@@ -43,9 +82,9 @@ def load_squad_train(tokenizer, num_samples=None):
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     return train_dataset
 
-def load_squad_dev(tokenizer, num_samples=200):
-    eval_dataset = load_dataset("squad", split="validation").select(range(num_samples)) if num_samples else load_dataset("squad", split="validation")
-    PROMPT_TEMPLATE = "{c}\n\n{q}\n\n"
+def load_squad_eval(tokenizer, num_samples=200, split="validation"):
+    eval_dataset = load_dataset("squad", split=split)
+    eval_dataset= eval_dataset.select(range(num_samples)) if num_samples else eval_dataset
 
     def eval_preprocess(examples):
         tokenizer.padding_side = "left"
@@ -215,7 +254,8 @@ class Trainer:
                         pad_token_id=self.tokenizer.pad_token_id,
                         temperature=0.,
                         do_sample=False,
-                        top_p=0.9
+                        top_p=0.9,
+                        max_new_tokens=30
                     )
                 # Decode only the newly generated tokens
                 outputs = self.tokenizer.batch_decode(generated_ids[:, batch["input_ids"].size(1):], skip_special_tokens=True)
@@ -223,7 +263,7 @@ class Trainer:
                 # Format for SQuAD metric
 
             assert len(generated_texts) == len(self.eval_info["id"]) and len(generated_texts) == len(self.eval_info["answers"])
-            predictions = [{"prediction_text": t.strip(), "id": id_} for t, id_ in zip(generated_texts, self.eval_info["id"])]
+            predictions = [{"prediction_text": t.split('\n')[0].strip(), "id": id_} for t, id_ in zip(generated_texts, self.eval_info["id"])]
             references = [{"answers": a, "id": id_} for a, id_ in zip(self.eval_info["answers"], self.eval_info["id"])]
             results = squad_metric.compute(predictions=predictions, references=references)
             tqdm.write(f"[{name.upper()}] F1 = {results['f1']:.2f}, EM = {results['exact_match']:.2f}")
@@ -234,10 +274,18 @@ class Trainer:
         print(f"Adapters saved to {output_dir}")
 
     def _instantnet_step(self, batch):
-        """Aggregate loss from all precisions and do knowledge distillation"""
+        """Aggregate loss from all precisions and do knowledge distillation from higher preicsion to lower precision"""
         self.optimizer.zero_grad()
         logits_cache = {}
         total_loss = 0.0
+
+        # Get FP16/FP32 teacher logits
+        with torch.no_grad():
+            with self.switchable_model.model.disable_adapter():
+                for name in self.switchable_model.target_modules:
+                    self.switchable_model.model.base_model.get_submodule(name + ".base_layer").set_bit_width(0)
+                teacher_16bit_logits = self.switchable_model(**batch).logits
+                logits_cache[16] = teacher_16bit_logits
 
         # Loop through student configs from highest to lowest precision
         for bw_order, bw in enumerate(self.ordered_bws):
@@ -251,8 +299,9 @@ class Trainer:
             logits_cache[bw] = student_logits
 
             # Calculate KD loss from all higher-precision teachers
+            # Warmup highest quant bit b4 kd
             kd_loss = 0.0
-            if bw_order > 0 and self.step > 300 and self.use_kd:
+            if self.step > 300 and self.use_kd: 
                 attn_mask = batch["attention_mask"]
                 teachers = [t for t in logits_cache.keys() if t > bw]
                 for teacher_bw in teachers:
