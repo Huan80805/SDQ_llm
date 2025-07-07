@@ -23,7 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description="Layer-wise Sensitivity Analysis using MSE")
     parser.add_argument('--model_path', type=str, required=True, help='Path to the directory containing all saved LoRA adapters.')
     parser.add_argument('--num_samples', type=int, default=100, help='Number of SQuAD samples to use for analysis.')
-    parser.add_argument('--output_file', type=str, default='sensitivity_ranking.json', help='Path to save the sensitivity ranking JSON file.')
+    parser.add_argument('--output_file', type=str, default='sensitivity.json', help='Path to save the sensitivity ranking JSON file.')
     parser.add_argument('--batch_size', type=int, default=8)
     args = parser.parse_args()
     torch.manual_seed(0)

@@ -8,4 +8,4 @@ logs/
 squad_gpt_sft/*
 test.json
 advbench/
-squad_gpt_sft/
+squad_gpt2_sft/

@@ -2,15 +2,15 @@
 use the ranking file to start the search for the optimal configuration. 
 This will take longer as it runs the full evaluation harness multiple times.
 """
-import torch
 import argparse
 import json
-import subprocess
-import re
+import os
 import pandas as pd
-from src import SUPPORTED_BWS
-from quant_model_eval import eval_model_with_bitmap
+from src import SUPPORTED_BWS, load_squad_eval
+import evaluate
+from quant_model_eval import eval_model_with_bitmap, load_switchable_model
 from tqdm import tqdm
+from torch.utils.data import DataLoader
 def main():
     parser = argparse.ArgumentParser(description="Greedy Search for Optimal Mixed-Precision Bitmap")
     parser.add_argument('--model_path', '-m', type=str, required=True, help='Path to the directory with saved LoRA adapters.')
@@ -21,16 +21,38 @@ def main():
     parser.add_argument('--output_jsonl', '-o', type=str, default='./analysis/greedy_search_spnet.jsonl', help='Path to save the results of the search.')
     parser.add_argument('--num_samples', '-n', type=int, default=500, help='Number of samples to do eval (for speedup)')
     args = parser.parse_args()
+    device = 'cuda:0'
 
+    # --- Re‑use base FP model & dataloader across all trials --- 
+    switchable_model, tokenizer = load_switchable_model(args.model_path, verbose=False)
+    ds, info = load_squad_eval(tokenizer, num_samples=args.num_samples, split='train')
+    eval_dataloader = DataLoader(ds, batch_size=args.batch_size)
+    squad_metric = evaluate.load('squad')
+
+    def quick_eval(bitmap):
+        return eval_model_with_bitmap(
+            model_path=args.model_path,
+            bitmap=bitmap,
+            batch_size=args.batch_size,
+            num_eval_samples=None,
+            split='train',
+            verbose=False,
+            switchable_model=switchable_model,
+            tokenizer=tokenizer,
+            eval_dataloader=eval_dataloader,
+            eval_info=info,
+            squad_metric=squad_metric,
+            device=device,
+        )
     # --- Load Sensitivity Analysis File and Rank by Layers ---
     with open(args.sensitivity_file, 'r') as f:
         error_totals = json.load(f)
-        # --- Rank layers by sensitivity---
+    # --- Rank layers by sensitivity---
     ERROR_TYPE = "mse"
-    ranking = {}
-    for bw in SUPPORTED_BWS:
-        sorted_layers = sorted(error_totals.keys(), key=lambda k: error_totals[k][f'{bw}-bit'][ERROR_TYPE])
-        ranking[f'{bw}bit'] = sorted_layers
+    ranking = {
+        f'{bw}bit': sorted(error_totals.keys(), key=lambda k: error_totals[k][f'{bw}-bit'][ERROR_TYPE])
+        for bw in SUPPORTED_BWS
+    }
     
     ordered_layer_names = list(error_totals.keys()) # architectural layers in order
     num_layers = len(ordered_layer_names)
@@ -39,13 +61,13 @@ def main():
     # --- Baseline Evaluation (all FP) ---
     print(f"\n- Evaluting FP GPT2 ...")
     baseline_bitmap = [0] * num_layers # not using layer name for simplicity
-    baseline_metrics = eval_model_with_bitmap(args.model_path, baseline_bitmap, args.batch_size, num_eval_samples=args.num_samples, split="train", verbose=False)
+    baseline_metrics = quick_eval(baseline_bitmap)
     results_log.append({'bitmap': baseline_bitmap, **baseline_metrics, 'accepted': True})
     base_F1 = baseline_metrics['F1']
     budget = args.budget * base_F1
     # --- Baseline Evaluation (all 8-bit) ---
     print(f"\n- Evaluting Int8 GPT2 ...")
-    eval_model_with_bitmap(args.model_path, [8] * num_layers, args.batch_size, num_eval_samples=args.num_samples, split="train", verbose=False)
+    quick_eval([8] * num_layers)
     # results_log.append({'bitmap': baseline_bitmap, **baseline_metrics})
     
     # --- Greedy Search for lower precision ---
@@ -59,7 +81,7 @@ def main():
                 trial_bitmap = list(current_bitmap)
                 trial_bitmap[layer_idx] = bw
                 # eval new bitmap
-                trial_metrics = eval_model_with_bitmap(args.model_path, trial_bitmap, args.batch_size, num_eval_samples=args.num_samples, split="train", verbose=False)
+                trial_metrics = quick_eval(trial_bitmap)
                 if base_F1 - trial_metrics['F1'] <= budget:
                     tqdm.write(f"  [ACCEPT] {layer_name} -> {bw}-bit. F1 drop: {base_F1 - trial_metrics['F1']:.2f} <= {budget}")
                     results_log.append({'bitmap': current_bitmap, **trial_metrics, 'accepted': True})
@@ -74,7 +96,7 @@ def main():
                         tqdm.write('  Max trials reached, moving to next precision')
                         break
         print(f"\n- Finished {bw}-bit search. Evaluating final bitmap...")
-        eval_model_with_bitmap(args.model_path, current_bitmap, args.batch_size, args.num_samples, "train", verbose=False)
+        quick_eval(current_bitmap)
         # results_log.append({'bitmap': current_bitmap, **metrics})
 
 
