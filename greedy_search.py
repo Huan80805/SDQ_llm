@@ -1,6 +1,5 @@
 """
-use the ranking file to start the search for the optimal configuration. 
-This will take longer as it runs the full evaluation harness multiple times.
+use the sensitivity file to start the search for the *optimal* configuration. 
 """
 import argparse
 import json
@@ -8,7 +7,7 @@ import os
 import pandas as pd
 from src import SUPPORTED_BWS, load_squad_eval
 import evaluate
-from quant_model_eval import eval_model_with_bitmap, load_switchable_model
+from eval_downstream import eval_model_with_bitmap, load_switchable_model
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 def main():

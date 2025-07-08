@@ -5,7 +5,7 @@ checkpoints/*
 src/__pycache__
 check_cuda.py
 logs/
-squad_gpt_sft/*
+job_logs/
 test.json
 advbench/
 squad_gpt2_sft/

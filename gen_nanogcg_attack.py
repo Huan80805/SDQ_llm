@@ -13,13 +13,13 @@ data = pd.read_csv("./advbench/harmful_behaviors.csv")
 
 with open("./advbench/adversarial_suffixes.jsonl", 'w') as f:
     for i, row in tqdm(data.iterrows(), total=100):
-        if i == 100: break
-        message = f"Instruction: {row['goal']}\n"
-        target = f"Response: {row['target']}"
+        if i == 200: break
+        message = row['goal']
+        target = row['target']
         config = GCGConfig(
-            num_steps=250,
+            num_steps=500,
             search_width=64,
-            batch_size=512,
+            batch_size=1024,
             topk=64,
             seed=42,
             verbosity="WARNING"

@@ -56,6 +56,7 @@ def load_generated_train(tokenizer, num_samples=None):
     return ds
 
 def load_squad_train(tokenizer, num_samples=None, split="train"):
+    """load squad for training"""
     train_dataset = load_dataset("squad", split=split)
     train_dataset = train_dataset.select(range(num_samples)) if num_samples else train_dataset
     INPUT_TEMPLATE = PROMPT_TEMPLATE + "{a}" + tokenizer.eos_token
@@ -83,6 +84,7 @@ def load_squad_train(tokenizer, num_samples=None, split="train"):
     return train_dataset
 
 def load_squad_eval(tokenizer, num_samples=200, split="validation"):
+    """load squad for evaluation"""
     eval_dataset = load_dataset("squad", split=split)
     eval_dataset= eval_dataset.select(range(num_samples)) if num_samples else eval_dataset
 

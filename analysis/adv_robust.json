@@ -1,0 +1,30 @@
+{
+    "fp": {
+        "ASR": 0.955,
+        "elapsed_time": 5.84
+    },
+    "int8": {
+        "ASR": 0.95,
+        "elapsed_time": 8.41
+    },
+    "stripe8&4": {
+        "ASR": 0.7567,
+        "elapsed_time": 8.48
+    },
+    "int4": {
+        "ASR": 0.61,
+        "elapsed_time": 8.57
+    },
+    "stripe4&2": {
+        "ASR": 0.488,
+        "elapsed_time": 8.37
+    },
+    "int2": {
+        "ASR": 0.4067,
+        "elapsed_time": 8.34
+    },
+    "random": {
+        "ASR": 0.4207,
+        "elapsed_time": 6.69
+    }
+}

@@ -38,11 +38,11 @@ def parse_bitmap(bitmap: Union[str, List[int]], num_layers: int):
 # enable cache: load base FP model + adapters once (on **CPU**)
 @lru_cache(maxsize=None)
 def load_switchable_model(model_path: str, verbose: bool = True):
-    """Return *(model, tokenizer)* with LoRA adapters loaded (CPU‑resident)."""
+    """Return model and tokenizer with LoRA adapters loaded (CPU‑resident)."""
     model = AutoModelForCausalLM.from_pretrained('gpt2')
-    tok = AutoTokenizer.from_pretrained('gpt2')
-    if not tok.pad_token:
-        tok.pad_token = tok.eos_token
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # add switchable quant + adaptive adapters wrappers
     model = patch_gpt2_with_quantization(model)
@@ -58,10 +58,7 @@ def load_switchable_model(model_path: str, verbose: bool = True):
         print(f"- Loaded {loaded} trained adapters from {model_path}")
 
     model.model.to('cpu').eval()
-    return model, tok
-
-
-# Core evaluation routine (shared by CLI & greedy_search)
+    return model, tokenizer
 
 def evaluate_performance(
     model,
@@ -81,7 +78,7 @@ def evaluate_performance(
 
     total_gen_tok = 0
     generations = []
-
+    tokenizer.padding_side='left'
     for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
         inputs = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
