@@ -1,10 +1,9 @@
-# Efficient LLMs via Switchable and Dynamic Quantization
-
+# Switchable and Dynamic Quantization
 
 ## Project Workflow
 1.  **Setup**: Install the required dependencies.
     ```bash
-    pip install torch transformers datasets evaluate peft tensorboard tqdm
+    pip install torch transformers datasets evaluate peft tensorboard tqdm nanogcg
     ```
 
 2.  **Training**: Run the main training script to fine-tune the quantized GPT-2 model on the generated data. The generated data follows the approach in [LLM-QAT](https://arxiv.org/abs/2305.17888). I use SQuAD (`context` + `question`) to prompt GPT-2 to generate completions for quantization fine-tuning. Run **`python gen_data.py`**, and text data will be generated and saved at `squad_gpt2_sft/`
