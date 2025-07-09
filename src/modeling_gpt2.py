@@ -141,7 +141,7 @@ def create_quant_model_for_inference(model: PeftModel, bitmap_config:Dict[str, i
             bias=(child_mod.bias is not None),
             bit_width=bit_width
         ).to(device)
-        
+
         # Use the weights from the source module to quantize and pack the weights for the new inference layer.
         inf_layer.quantize_and_pack(child_mod.weight.data, child_mod.bias.data if child_mod.bias is not None else None)
         # Replace the original QuantLinear layer with the new, memory-efficient InferenceQuantLinear layer

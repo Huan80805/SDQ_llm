@@ -53,7 +53,7 @@ For adversarial attacks, I use [nanoGCG](https://github.com/GraySwanAI/nanoGCG),
 
 ## Important Scripts and Usage
 
-### `main.py`
+#### `main.py`
 
 -   **Purpose**: The main entry point for training a switchable quantized model. Will save lora adapters.
 -   **Usage**:
@@ -66,7 +66,7 @@ For adversarial attacks, I use [nanoGCG](https://github.com/GraySwanAI/nanoGCG),
         --use_tensorboard
     ```
 
-### `eval_downstream.py`
+#### `eval_downstream.py`
 
 -   **Purpose**: Evaluate a trained model with a specific quantization bitmap.
 -   **Usage**:
@@ -78,7 +78,7 @@ For adversarial attacks, I use [nanoGCG](https://github.com/GraySwanAI/nanoGCG),
     python eval.py --model_path $path_to_lora_adapters --bitmap "8,8,4,4,8,8,4,4,2,2,2,2,..."
     ```
 
-### `sensitivity_analysis.py`
+#### `sensitivity_analysis.py`
 
 -   **Purpose**: Rank layers by their sensitivity to quantization to inform manual or automated mixed-precision strategies.
 -   **Usage**:
@@ -89,7 +89,7 @@ For adversarial attacks, I use [nanoGCG](https://github.com/GraySwanAI/nanoGCG),
     ```
     -   This will generate `sensitivity.json`, which stores the MSE for combinations of linear layer and quantization level.
 
-### `greedy_search.py`
+#### `greedy_search.py`
 
 -   **Purpose**: Automatically find a high-performing mixed-precision configuration that respects a performance budget.
 -   **Usage**:

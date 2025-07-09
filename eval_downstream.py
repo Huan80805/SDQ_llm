@@ -3,6 +3,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.data import DataLoader
 import argparse
+import pandas as pd
 import time
 import os
 import evaluate
@@ -71,7 +72,6 @@ def evaluate_performance(
     """Compute EM, F1, tokens/s and peak VRAM."""
     squad_metric = squad_metric or evaluate.load('squad')
 
-    torch.cuda.reset_peak_memory_stats(device)
     model.eval()
     torch.cuda.synchronize()
     start = time.time()
@@ -93,7 +93,6 @@ def evaluate_performance(
         generations.extend(gens)
 
     torch.cuda.synchronize()
-    peak_vram = torch.cuda.max_memory_allocated(device) / 1024 ** 2
     t = max(time.time() - start, 1e-6)
 
     preds = [{"prediction_text": g.strip(), "id": i} for g, i in zip(generations, eval_info["id"])]
@@ -103,7 +102,6 @@ def evaluate_performance(
     return {
         "EM": round(res['exact_match'], 4),
         "F1": round(res['f1'], 4),
-        "VRAM_MB": round(peak_vram, 2),
         "tokens_per_s": round(total_gen_tok / t, 2),
     }
 
@@ -127,13 +125,6 @@ def eval_model_with_bitmap(
 
     if switchable_model is None or tokenizer is None:
         switchable_model, tokenizer = load_switchable_model(model_path, verbose)
-
-    # Build (or reuse) dataloader
-    if eval_dataloader is None or eval_info is None:
-        ds, info = load_squad_eval(tokenizer, num_samples=num_eval_samples, split=split)
-        eval_dataloader = DataLoader(ds, batch_size=batch_size)
-        eval_info = info
-
 
     # Prepare quant / fp model for the given bitmap
     num_layers = len(switchable_model.target_modules)
@@ -161,9 +152,18 @@ def eval_model_with_bitmap(
         model = create_quant_model_for_inference(switchable_model_clone.model, bitmap_cfg).to(device)
         quant_clone = True
 
+    param_bytes = sum(t.numel() * t.element_size() for t in model.state_dict().values())
+    return {"Weights_MB": round(param_bytes/1024**2, 2)}
+
+    # Build (or reuse) dataloader
+    if eval_dataloader is None or eval_info is None:
+        ds, info = load_squad_eval(tokenizer, num_samples=num_eval_samples, split=split)
+        eval_dataloader = DataLoader(ds, batch_size=batch_size)
+        eval_info = info
+
     # Run evaluation
     metrics = evaluate_performance( model, tokenizer, eval_dataloader, eval_info, device, squad_metric)
-
+    metrics = {**metrics, "Weights_MB": round(param_bytes/1024**2, 2)}
     print("\n- Results:", json.dumps(metrics))
 
     # Clean‑up GPU VRAM: move model back to CPU & delete clone
@@ -176,10 +176,57 @@ def eval_model_with_bitmap(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluation Harness for Switchable Quantization")
-    parser.add_argument('--model_path', type=str, required=True, help='Path to the directory containing all saved LoRA adapters.')
-    parser.add_argument('--bitmap', type=str, required=True, help='Comma-separated bit-width vector (e.g., "8,8,4,2,...") or a single number for all layers.')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation.')
-    parser.add_argument('--num_eval_samples', "-n", type=int, default=None)
-    parser.add_argument('--split', type=str, help="Split of the dataset to eval on", default="validation")
+    parser.add_argument('--method', type=str, required=True)
+    # parser.add_argument('--model_path', type=str, required=True, help='Path to the directory containing all saved LoRA adapters.')
+    # parser.add_argument('--bitmap', type=str, required=True, help='Comma-separated bit-width vector (e.g., "8,8,4,2,...") or a single number for all layers.')
+    # parser.add_argument('--batch_size', type=int, default=128, help='Batch size for evaluation.')
+    # parser.add_argument('--num_eval_samples', "-n", type=int, default=None)
+    # parser.add_argument('--split', type=str, help="Split of the dataset to eval on", default="validation")
     args = parser.parse_args()
-    eval_model_with_bitmap(model_path = args.model_path, bitmap = args.bitmap, batch_size = args.batch_size, num_eval_samples = args.num_eval_samples, split=args.split)
+    # eval_model_with_bitmap(model_path = args.model_path, bitmap = args.bitmap, batch_size = args.batch_size, num_eval_samples = args.num_eval_samples, split=args.split)
+    method = args.method
+    # with open(f'final_results/{method}.jsonl', 'r') as f:
+    old_file = pd.read_json(f'final_results/{method}.jsonl', lines=True, orient='records')
+    with open(f'final_results/{method}.jsonl-new', 'w') as new_file:
+        row_idx = 0
+
+        model_path = f'./checkpoints/{method}/step_1000'
+        num_layers = 48
+        bitmaps = {
+            "fp": [0] * num_layers,
+            "int8": [8] * num_layers,
+            "stripe8&4": [ 4*(n%2+1) for n in range(num_layers)],
+            "int4": [4] * num_layers,
+            "stripe4&2": [ 2*(n%2+1) for n in range(num_layers)],
+            "int2": [2] * num_layers,
+        }
+        for cfg_name, bitmap in bitmaps.items():
+            tqdm.write(cfg_name)
+            metrics = eval_model_with_bitmap(model_path = model_path, bitmap = bitmap, batch_size = 100, split='validation', verbose=False)
+
+            data = old_file.loc[row_idx].to_dict()
+            # data.pop('VRAM_MB')
+            new_file.write(json.dumps({**data, **metrics, 'accepted': None}))
+            new_file.write('\n')
+            row_idx += 1
+
+            # f.write(json.dumps({'cfg_name': cfg_name, **metrics}))
+            # f.write('\n')
+            # f.flush()
+            
+
+        gs_file_path = f'./analysis/gs_{method}_log.jsonl'
+        gs_result = pd.read_json(gs_file_path, lines=True, orient='records')
+        bitmaps = gs_result['bitmap'].tolist()
+        accepted = gs_result['accepted'].tolist()
+        for bitmap in tqdm(bitmaps, desc='greedy search bitmap eval'):
+            metrics = eval_model_with_bitmap(model_path = model_path, bitmap = bitmap, batch_size = 100, split='validation', verbose=False)
+
+            data = old_file.loc[row_idx].to_dict()
+            # data.pop('VRAM_MB')
+            new_file.write(json.dumps({**data, **metrics, 'accepted': accepted[row_idx-6]}))
+            new_file.write('\n')
+            row_idx += 1
+            # f.write(json.dumps({'cfg_name': 'greedy search', **metrics}))
+            # f.write('\n')
+            # f.flush()
