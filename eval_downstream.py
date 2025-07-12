@@ -153,7 +153,7 @@ def eval_model_with_bitmap(
         quant_clone = True
 
     param_bytes = sum(t.numel() * t.element_size() for t in model.state_dict().values())
-    return {"Weights_MB": round(param_bytes/1024**2, 2)}
+    # return {"Weights_MB": round(param_bytes/1024**2, 2)}
 
     # Build (or reuse) dataloader
     if eval_dataloader is None or eval_info is None:
@@ -176,57 +176,42 @@ def eval_model_with_bitmap(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluation Harness for Switchable Quantization")
-    parser.add_argument('--method', type=str, required=True)
-    # parser.add_argument('--model_path', type=str, required=True, help='Path to the directory containing all saved LoRA adapters.')
-    # parser.add_argument('--bitmap', type=str, required=True, help='Comma-separated bit-width vector (e.g., "8,8,4,2,...") or a single number for all layers.')
-    # parser.add_argument('--batch_size', type=int, default=128, help='Batch size for evaluation.')
-    # parser.add_argument('--num_eval_samples', "-n", type=int, default=None)
-    # parser.add_argument('--split', type=str, help="Split of the dataset to eval on", default="validation")
+    # parser.add_argument('--method', type=str, required=True)
+    parser.add_argument('--model_path', type=str, required=True, help='Path to the directory containing all saved LoRA adapters.')
+    parser.add_argument('--bitmap', type=str, required=True, help='Comma-separated bit-width vector (e.g., "8,8,4,2,...") or a single number for all layers.')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size for evaluation.')
+    parser.add_argument('--num_eval_samples', "-n", type=int, default=None)
+    parser.add_argument('--split', type=str, help="Split of the dataset to eval on", default="validation")
     args = parser.parse_args()
-    # eval_model_with_bitmap(model_path = args.model_path, bitmap = args.bitmap, batch_size = args.batch_size, num_eval_samples = args.num_eval_samples, split=args.split)
-    method = args.method
+    eval_model_with_bitmap(model_path = args.model_path, bitmap = args.bitmap, batch_size = args.batch_size, num_eval_samples = args.num_eval_samples, split=args.split)
+    # method = args.method
     # with open(f'final_results/{method}.jsonl', 'r') as f:
-    old_file = pd.read_json(f'final_results/{method}.jsonl', lines=True, orient='records')
-    with open(f'final_results/{method}.jsonl-new', 'w') as new_file:
-        row_idx = 0
 
-        model_path = f'./checkpoints/{method}/step_1000'
-        num_layers = 48
-        bitmaps = {
-            "fp": [0] * num_layers,
-            "int8": [8] * num_layers,
-            "stripe8&4": [ 4*(n%2+1) for n in range(num_layers)],
-            "int4": [4] * num_layers,
-            "stripe4&2": [ 2*(n%2+1) for n in range(num_layers)],
-            "int2": [2] * num_layers,
-        }
-        for cfg_name, bitmap in bitmaps.items():
-            tqdm.write(cfg_name)
-            metrics = eval_model_with_bitmap(model_path = model_path, bitmap = bitmap, batch_size = 100, split='validation', verbose=False)
+    #     model_path = f'./checkpoints/{method}/step_1000'
+    #     num_layers = 48
+    #     bitmaps = {
+    #         "fp": [0] * num_layers,
+    #         "int8": [8] * num_layers,
+    #         "stripe8&4": [ 4*(n%2+1) for n in range(num_layers)],
+    #         "int4": [4] * num_layers,
+    #         "stripe4&2": [ 2*(n%2+1) for n in range(num_layers)],
+    #         "int2": [2] * num_layers,
+    #     }
+    #     for cfg_name, bitmap in bitmaps.items():
+    #         tqdm.write(cfg_name)
+    #         metrics = eval_model_with_bitmap(model_path = model_path, bitmap = bitmap, batch_size = 100, split='validation', verbose=False)
+    #         row_idx += 1
+    #         f.write(json.dumps({'cfg_name': cfg_name, **metrics, 'accepted': None}))
+    #         f.write('\n')
+    #         f.flush()
 
-            data = old_file.loc[row_idx].to_dict()
-            # data.pop('VRAM_MB')
-            new_file.write(json.dumps({**data, **metrics, 'accepted': None}))
-            new_file.write('\n')
-            row_idx += 1
-
-            # f.write(json.dumps({'cfg_name': cfg_name, **metrics}))
-            # f.write('\n')
-            # f.flush()
-            
-
-        gs_file_path = f'./analysis/gs_{method}_log.jsonl'
-        gs_result = pd.read_json(gs_file_path, lines=True, orient='records')
-        bitmaps = gs_result['bitmap'].tolist()
-        accepted = gs_result['accepted'].tolist()
-        for bitmap in tqdm(bitmaps, desc='greedy search bitmap eval'):
-            metrics = eval_model_with_bitmap(model_path = model_path, bitmap = bitmap, batch_size = 100, split='validation', verbose=False)
-
-            data = old_file.loc[row_idx].to_dict()
-            # data.pop('VRAM_MB')
-            new_file.write(json.dumps({**data, **metrics, 'accepted': accepted[row_idx-6]}))
-            new_file.write('\n')
-            row_idx += 1
-            # f.write(json.dumps({'cfg_name': 'greedy search', **metrics}))
-            # f.write('\n')
-            # f.flush()
+    #     gs_file_path = f'./analysis/gs_{method}_log.jsonl'
+    #     gs_result = pd.read_json(gs_file_path, lines=True, orient='records')
+    #     bitmaps = gs_result['bitmap'].tolist()
+    #     accepted = gs_result['accepted'].tolist()
+    #     for bitmap in tqdm(bitmaps, desc='greedy search bitmap eval'):
+    #         metrics = eval_model_with_bitmap(model_path = model_path, bitmap = bitmap, batch_size = 100, split='validation', verbose=False)
+    #         row_idx += 1
+    #         f.write(json.dumps({'cfg_name': 'greedy search', **metrics, 'accepted': accepted[row_idx-6]}))
+    #         f.write('\n')
+    #         f.flush()

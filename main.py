@@ -42,8 +42,8 @@ def main():
     quant_model = patch_gpt2_with_quantization(model)
     print("- Patching quantized model with adaptive Lora...")
     switchable_model = patch_gpt2_with_adaptive_adapters(quant_model, supported_bws=SUPPORTED_BWS)
-    train_dataset = load_squad_train(tokenizer)
-    # train_dataset = load_generated_train(tokenizer)
+    # train_dataset = load_squad_train(tokenizer) # normal SFT
+    train_dataset = load_generated_train(tokenizer) # QAT-style SFT
     eval_dataset, eval_info = load_squad_eval(tokenizer)
     trainer = Trainer(
         switchable_model=switchable_model,
@@ -62,7 +62,5 @@ def main():
 
     if writer:
         writer.close()
-# To run this test:
-# pytest -s tests/test_training_on_squad.py
 if __name__ == "__main__":
     main()

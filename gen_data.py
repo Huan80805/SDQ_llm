@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# make_squad_gpt2_corpus.py
 """
 Use QA datasets to generate SFT data for Quantization
 1. Loads GPT-2 as a generation model
